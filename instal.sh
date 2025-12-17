@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### Vortex MC Control Plane Installer (Modular + Auto Allocation)
-### Ubuntu 22.04 only
-### Writes ALL required files under /opt/vortex-mc and runs docker compose.
-### One-line install: bash <(curl -fsSL https://raw.githubusercontent.com/YOURUSER/YOURREPO/main/install.sh)
+### Vortex MC Control Plane Installer (Ubuntu 25.04)
+### Installs: Dashboard + Worker + Postgres + Redis + Caddy
+### Features: Plans (free/paid), Egg Profiles, Plan↔Egg mapping, Coupons, Discord OAuth, Stripe subscriptions, Pterodactyl provisioning
+### Pterodactyl: auto user mapping (Approach B) + auto allocation selection by Node ID
+###
+### One-line:
+###   sudo -i
+###   bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/refs/heads/main/instal.sh)
 
 DOMAIN_DEFAULT="dashboard.vortexhosting.onl"
 INSTALL_DIR="/opt/vortex-mc"
@@ -15,11 +19,11 @@ die() { echo -e "[vortex][error] $*" >&2; exit 1; }
 
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo -i) then retry."; }
 
-require_ubuntu_2204() {
+require_ubuntu_2504() {
   [[ -f /etc/os-release ]] || die "Cannot detect OS."
   . /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "Ubuntu only. Detected: ${ID:-unknown}"
-  [[ "${VERSION_ID:-}" == "22.04" ]] || die "Target is Ubuntu 22.04. Detected: ${VERSION_ID:-unknown}"
+  [[ "${ID:-}" == "ubuntu" ]] || die "Ubuntu required. Detected: ${ID:-unknown}"
+  [[ "${VERSION_ID:-}" == "25.04" ]] || die "Target is Ubuntu 25.04. Detected: ${VERSION_ID:-unknown}"
 }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -27,21 +31,27 @@ need_cmd() { command -v "$1" >/dev/null 2>&1; }
 install_packages() {
   log "Installing base packages..."
   apt-get update -y
-  apt-get install -y curl ca-certificates gnupg lsb-release ufw openssl git
+  apt-get install -y curl ca-certificates gnupg lsb-release ufw openssl git jq
 }
 
-install_docker() {
-  if need_cmd docker; then log "Docker already installed."; return; fi
-  log "Installing Docker..."
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-  . /etc/os-release
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
-    | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
+install_docker_2504() {
+  if need_cmd docker; then
+    log "Docker already installed."
+  else
+    log "Installing Docker using official convenience script (recommended for Ubuntu 25.04)..."
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+  fi
+
+  # Ensure docker compose is available
+  if docker compose version >/dev/null 2>&1; then
+    log "docker compose is available."
+  else
+    log "Installing docker compose plugin..."
+    apt-get update -y
+    apt-get install -y docker-compose-plugin
+    docker compose version >/dev/null 2>&1 || die "docker compose still missing after install."
+  fi
 }
 
 configure_firewall() {
@@ -60,7 +70,7 @@ ensure_env() {
   chmod 700 "${INSTALL_DIR}"
 
   if [[ -f "${INSTALL_DIR}/.env" ]]; then
-    log ".env exists; preserving secrets."
+    log ".env exists; preserving secrets and updating domain/base URL."
     sed -i "s/^DOMAIN=.*/DOMAIN=${domain}/" "${INSTALL_DIR}/.env" || true
     if grep -q "^APP_BASE_URL=" "${INSTALL_DIR}/.env"; then
       sed -i "s#^APP_BASE_URL=.*#APP_BASE_URL=https://${domain}#" "${INSTALL_DIR}/.env" || true
@@ -98,8 +108,9 @@ EOF
 
 write_stack() {
   local domain="${1:-$DOMAIN_DEFAULT}"
-  log "Writing docker-compose.yml, Caddyfile, DB init, app + worker..."
+  log "Writing stack files and sources into ${INSTALL_DIR}..."
   mkdir -p "${INSTALL_DIR}/caddy" "${INSTALL_DIR}/db" "${INSTALL_DIR}/app" "${INSTALL_DIR}/worker"
+  mkdir -p "${INSTALL_DIR}/app/views"
 
   cat > "${INSTALL_DIR}/docker-compose.yml" <<'EOF'
 services:
@@ -118,7 +129,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
-      retries: 50
+      retries: 60
 
   redis:
     image: redis:7-alpine
@@ -189,32 +200,38 @@ create table if not exists users (
   email text unique,
   password_hash text,
   role text not null default 'user',
+
   discord_id text unique,
   discord_username text,
   discord_avatar text,
+
   stripe_customer_id text,
   ptero_user_id int,
+
   created_at timestamptz not null default now()
 );
 
 create table if not exists app_settings (
   id boolean primary key default true,
 
+  -- Discord
   discord_client_id text,
   discord_client_secret_enc text,
   discord_enabled boolean not null default false,
 
+  -- Stripe
   stripe_secret_key_enc text,
   stripe_webhook_secret_enc text,
   stripe_enabled boolean not null default false,
 
+  -- Pterodactyl
   ptero_url text,
   ptero_app_api_key_enc text,
   ptero_enabled boolean not null default false,
 
   ptero_location_id int,
-  ptero_node_id int,         -- for auto allocation
-  ptero_allocation_id int,   -- fallback allocation
+  ptero_node_id int,         -- preferred for auto allocation
+  ptero_allocation_id int,   -- fallback
 
   updated_at timestamptz not null default now(),
   updated_by_user_id uuid
@@ -228,11 +245,15 @@ create table if not exists plans (
   name text not null,
   kind text not null default 'stripe_subscription' check (kind in ('free','stripe_subscription')),
   active boolean not null default true,
+
   stripe_price_id text,
+
   memory_mb int not null default 2048,
   disk_mb int not null default 10240,
   cpu int not null default 100,
+
   max_services_per_user int not null default 1,
+
   created_at timestamptz not null default now()
 );
 
@@ -241,9 +262,11 @@ create table if not exists egg_profiles (
   name text not null,
   description text,
   ptero_egg_id int not null,
+
   docker_image text,
   startup text,
   environment_json jsonb not null default '{}'::jsonb,
+
   active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -275,6 +298,7 @@ create table if not exists services (
 
   stripe_subscription_id text,
   stripe_invoice_id text,
+
   ptero_server_id text,
 
   created_at timestamptz not null default now(),
@@ -291,6 +315,7 @@ create table if not exists audit_log (
   user_agent text
 );
 
+-- Seed example objects if empty
 insert into egg_profiles (name, description, ptero_egg_id, active, environment_json)
 select 'Paper (Example)', 'Set your real egg ID + env vars', 1, true, '{}'::jsonb
 where not exists (select 1 from egg_profiles);
@@ -308,11 +333,13 @@ and not exists (
 );
 EOF
 
-  # App package + dockerfile
+  # --------------------
+  # APP
+  # --------------------
   cat > "${INSTALL_DIR}/app/package.json" <<'EOF'
 {
   "name": "vortex-mc-dashboard",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": { "start": "node server.js" },
@@ -337,10 +364,9 @@ COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 COPY . .
 EXPOSE 3000
-CMD ["npm", "run", "start"]
+CMD ["npm","run","start"]
 EOF
 
-  # App server (includes admin node_id + fallback allocation)
   cat > "${INSTALL_DIR}/app/server.js" <<'EOF'
 import express from "express";
 import session from "express-session";
@@ -354,6 +380,8 @@ import Stripe from "stripe";
 
 const app = express();
 app.set("view engine", "ejs");
+
+// Stripe webhook verification needs raw body
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -364,17 +392,15 @@ const SETTINGS_MASTER_KEY_B64 = process.env.SETTINGS_MASTER_KEY;
 const SESSION_SECRET = process.env.SESSION_SECRET || "change-me";
 const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost";
 
-if (!DATABASE_URL) throw new Error("DATABASE_URL missing");
-if (!REDIS_URL) throw new Error("REDIS_URL missing");
-if (!SETTINGS_MASTER_KEY_B64) throw new Error("SETTINGS_MASTER_KEY missing");
+if (!DATABASE_URL || !REDIS_URL || !SETTINGS_MASTER_KEY_B64) throw new Error("Missing env vars.");
 
 const masterKey = Buffer.from(SETTINGS_MASTER_KEY_B64, "base64");
-if (masterKey.length < 32) throw new Error("SETTINGS_MASTER_KEY must be >= 32 bytes base64");
+if (masterKey.length < 32) throw new Error("SETTINGS_MASTER_KEY must decode to >= 32 bytes.");
 const key32 = masterKey.subarray(0, 32);
 
 const pool = new Pool({ connectionString: DATABASE_URL });
-const RedisStore = connectRedis(session);
 
+const RedisStore = connectRedis(session);
 const redis = createClient({ url: REDIS_URL });
 await redis.connect();
 
@@ -498,6 +524,7 @@ app.post("/login", async (req, res) => {
 
 app.post("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
 
+// Discord OAuth
 app.get("/auth/discord", async (req, res) => {
   const s = await getSettings();
   if (!s.discord.enabled) return res.status(400).send("Discord login is disabled.");
@@ -534,9 +561,7 @@ app.get("/auth/discord/callback", async (req, res) => {
   if (!tokenRes.ok) return res.status(400).send("Discord token exchange failed.");
   const token = await tokenRes.json();
 
-  const meRes = await fetch("https://discord.com/api/users/@me", {
-    headers: { "Authorization": `Bearer ${token.access_token}` }
-  });
+  const meRes = await fetch("https://discord.com/api/users/@me", { headers: { "Authorization": `Bearer ${token.access_token}` } });
   if (!meRes.ok) return res.status(400).send("Failed to fetch Discord profile.");
   const me = await meRes.json();
 
@@ -579,6 +604,7 @@ app.get("/auth/discord/callback", async (req, res) => {
 app.get("/dashboard", requireAuth, async (req, res) => {
   const plans = await pool.query("select * from plans where active=true order by id asc");
   const eggs = await pool.query("select * from egg_profiles where active=true order by id asc");
+
   const services = await pool.query(
     `select s.*, p.name as plan_name, e.name as egg_name
      from services s
@@ -588,6 +614,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
      order by s.created_at desc`,
     [req.session.user.id]
   );
+
   res.render("dashboard", { user: req.session.user, baseUrl: APP_BASE_URL, plans: plans.rows, eggs: eggs.rows, services: services.rows });
 });
 
@@ -596,13 +623,14 @@ async function ensurePlanEggAllowed(planId, eggId) {
   return ok.rows.length > 0;
 }
 
+// Free order (provisions immediately)
 app.post("/order/free", requireAuth, async (req, res) => {
   const planId = Number(req.body.plan_id);
   const eggId = Number(req.body.egg_profile_id);
 
   const uQ = await pool.query("select * from users where id=$1", [req.session.user.id]);
   const user = uQ.rows[0];
-  if (!user.email) return res.status(400).send("Your account has no email address. Please login with Discord email scope before ordering.");
+  if (!user.email) return res.status(400).send("Your account has no email address. Login with Discord email scope before ordering.");
 
   const planQ = await pool.query("select * from plans where id=$1 and active=true", [planId]);
   if (!planQ.rows.length) return res.status(404).send("Plan not found.");
@@ -615,7 +643,10 @@ app.post("/order/free", requireAuth, async (req, res) => {
   const allowed = await ensurePlanEggAllowed(planId, eggId);
   if (!allowed) return res.status(400).send("This egg is not available on the selected plan.");
 
-  const countQ = await pool.query("select count(*)::int as c from services where user_id=$1 and plan_id=$2 and status in ('pending','active','suspended','error')", [user.id, planId]);
+  const countQ = await pool.query(
+    "select count(*)::int as c from services where user_id=$1 and plan_id=$2 and status in ('pending','active','suspended','error')",
+    [user.id, planId]
+  );
   if (countQ.rows[0].c >= plan.max_services_per_user) return res.status(400).send(`Free plan limit reached (max ${plan.max_services_per_user}).`);
 
   const svc = await pool.query("insert into services (user_id, plan_id, egg_profile_id, status) values ($1,$2,$3,'pending') returning id", [user.id, planId, eggId]);
@@ -623,6 +654,7 @@ app.post("/order/free", requireAuth, async (req, res) => {
   return res.redirect("/dashboard");
 });
 
+// Paid checkout (Stripe subscription)
 app.post("/checkout", requireAuth, async (req, res) => {
   const planId = Number(req.body.plan_id);
   const eggId = Number(req.body.egg_profile_id);
@@ -653,7 +685,7 @@ app.post("/checkout", requireAuth, async (req, res) => {
     const coupon = c.rows[0];
     if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) return res.status(400).send("Coupon expired.");
     if (coupon.max_redemptions && coupon.redeemed_count >= coupon.max_redemptions) return res.status(400).send("Coupon fully redeemed.");
-    if (!coupon.stripe_coupon_id) return res.status(400).send("Coupon exists but not linked to Stripe coupon ID.");
+    if (!coupon.stripe_coupon_id) return res.status(400).send("Coupon exists but is not linked to a Stripe coupon ID.");
     discounts = [{ coupon: coupon.stripe_coupon_id }];
   }
 
@@ -682,7 +714,9 @@ app.post("/checkout", requireAuth, async (req, res) => {
   return res.redirect(303, session.url);
 });
 
+// Admin routes
 app.get("/admin", requireAdmin, (_req, res) => res.redirect("/admin/settings/integrations"));
+
 app.get("/admin/settings/integrations", requireAdmin, async (req, res) => {
   const raw = await getSettingsRow();
   res.render("integrations", {
@@ -786,9 +820,116 @@ app.post("/admin/settings/integrations", requireAdmin, async (req, res) => {
   return res.redirect("/admin/settings/integrations");
 });
 
-// Minimal admin endpoints already exist in earlier script versions; for brevity this installer focuses on integrations + ordering + webhook.
-// If you want the full plans/eggs/mapping/coupons admin suite in this exact script, say so and I will expand this file accordingly.
+app.get("/admin/plans", requireAdmin, async (req, res) => {
+  const plans = await pool.query("select * from plans order by id asc");
+  res.render("plans", { user: req.session.user, baseUrl: APP_BASE_URL, plans: plans.rows });
+});
 
+app.post("/admin/plans", requireAdmin, async (req, res) => {
+  const name = (req.body.name || "").trim();
+  const kind = (req.body.kind || "").trim();
+  if (!name || !["free","stripe_subscription"].includes(kind)) return res.status(400).send("Invalid plan.");
+  await pool.query("insert into plans (name, kind, active) values ($1,$2,true)", [name, kind]);
+  return res.redirect("/admin/plans");
+});
+
+app.post("/admin/plans/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const kind = (req.body.kind || "").trim();
+  const active = req.body.active === "on";
+  const stripe_price_id = (req.body.stripe_price_id || "").trim() || null;
+
+  const memory_mb = Number(req.body.memory_mb || 2048);
+  const disk_mb = Number(req.body.disk_mb || 10240);
+  const cpu = Number(req.body.cpu || 100);
+  const max_services_per_user = Number(req.body.max_services_per_user || 1);
+
+  if (!["free","stripe_subscription"].includes(kind)) return res.status(400).send("Invalid plan kind.");
+
+  await pool.query(
+    `update plans set kind=$1, active=$2, stripe_price_id=$3, memory_mb=$4, disk_mb=$5, cpu=$6, max_services_per_user=$7 where id=$8`,
+    [kind, active, stripe_price_id, memory_mb, disk_mb, cpu, max_services_per_user, id]
+  );
+  return res.redirect("/admin/plans");
+});
+
+app.get("/admin/eggs", requireAdmin, async (req, res) => {
+  const eggs = await pool.query("select * from egg_profiles order by id asc");
+  res.render("eggs", { user: req.session.user, baseUrl: APP_BASE_URL, eggs: eggs.rows });
+});
+
+app.post("/admin/eggs", requireAdmin, async (req, res) => {
+  const name = (req.body.name || "").trim();
+  const ptero_egg_id = Number(req.body.ptero_egg_id || 0);
+  if (!name || !ptero_egg_id) return res.status(400).send("Invalid egg profile.");
+  await pool.query("insert into egg_profiles (name, ptero_egg_id, active, environment_json) values ($1,$2,true,'{}'::jsonb)", [name, ptero_egg_id]);
+  return res.redirect("/admin/eggs");
+});
+
+app.post("/admin/eggs/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const active = req.body.active === "on";
+  const name = (req.body.name || "").trim();
+  const description = (req.body.description || "").trim() || null;
+  const ptero_egg_id = Number(req.body.ptero_egg_id || 0);
+  const docker_image = (req.body.docker_image || "").trim() || null;
+  const startup = (req.body.startup || "").trim() || null;
+
+  let environment_json = "{}";
+  try { environment_json = JSON.stringify(JSON.parse(req.body.environment_json || "{}")); }
+  catch { return res.status(400).send("environment_json must be valid JSON."); }
+
+  if (!name || !ptero_egg_id) return res.status(400).send("Invalid egg profile.");
+
+  await pool.query(
+    `update egg_profiles set name=$1, description=$2, ptero_egg_id=$3, docker_image=$4, startup=$5, environment_json=$6::jsonb, active=$7 where id=$8`,
+    [name, description, ptero_egg_id, docker_image, startup, environment_json, active, id]
+  );
+  return res.redirect("/admin/eggs");
+});
+
+app.get("/admin/mappings", requireAdmin, async (req, res) => {
+  const plans = await pool.query("select * from plans order by id asc");
+  const eggs = await pool.query("select * from egg_profiles order by id asc");
+  const map = await pool.query("select * from plan_egg_profiles");
+  const set = new Set(map.rows.map(r => `${r.plan_id}:${r.egg_profile_id}`));
+  res.render("mappings", { user: req.session.user, baseUrl: APP_BASE_URL, plans: plans.rows, eggs: eggs.rows, set });
+});
+
+app.post("/admin/mappings", requireAdmin, async (req, res) => {
+  await pool.query("delete from plan_egg_profiles");
+  const keys = Object.keys(req.body).filter(k => k.startsWith("map_"));
+  for (const k of keys) {
+    const parts = k.split("_");
+    const planId = Number(parts[1]);
+    const eggId = Number(parts[2]);
+    if (planId && eggId) {
+      await pool.query("insert into plan_egg_profiles (plan_id, egg_profile_id) values ($1,$2) on conflict do nothing", [planId, eggId]);
+    }
+  }
+  return res.redirect("/admin/mappings");
+});
+
+app.get("/admin/coupons", requireAdmin, async (req, res) => {
+  const coupons = await pool.query("select * from coupons order by created_at desc");
+  res.render("coupons", { user: req.session.user, baseUrl: APP_BASE_URL, coupons: coupons.rows });
+});
+
+app.post("/admin/coupons", requireAdmin, async (req, res) => {
+  const code = (req.body.code || "").trim().toUpperCase();
+  const stripe_coupon_id = (req.body.stripe_coupon_id || "").trim() || null;
+  const max_redemptions = req.body.max_redemptions ? Number(req.body.max_redemptions) : null;
+  const expires_at = req.body.expires_at ? new Date(req.body.expires_at).toISOString() : null;
+
+  if (!code) return res.status(400).send("Invalid coupon code.");
+  await pool.query(
+    "insert into coupons (code, stripe_coupon_id, max_redemptions, expires_at, active) values ($1,$2,$3,$4,true)",
+    [code, stripe_coupon_id, max_redemptions, expires_at]
+  );
+  return res.redirect("/admin/coupons");
+});
+
+// Stripe webhook
 app.post("/webhooks/stripe", async (req, res) => {
   const s = await getSettings();
   if (!s.stripe.webhook_secret || !s.stripe.secret_key) return res.status(400).send("Stripe not configured.");
@@ -840,10 +981,11 @@ app.post("/webhooks/stripe", async (req, res) => {
 });
 
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
 app.listen(3000, () => console.log("Dashboard listening on :3000"));
 EOF
 
-  mkdir -p "${INSTALL_DIR}/app/views"
+  # Views
   cat > "${INSTALL_DIR}/app/views/login.ejs" <<'EOF'
 <!doctype html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -851,11 +993,14 @@ EOF
 <title>Login</title></head>
 <body><div class="wrap">
   <div class="card">
-    <div class="top"><h2 style="margin:0">Vortex Dashboard</h2><span class="muted"><%= baseUrl %></span></div>
+    <div class="top">
+      <h2 style="margin:0">Vortex Dashboard</h2>
+      <span class="muted"><%= baseUrl %></span>
+    </div>
     <% if (error) { %><p style="color:#ffb4b4"><%= error %></p><% } %>
     <form method="post" action="/login">
-      <label>Email</label><input name="email" required>
-      <label>Password</label><input name="password" type="password" required>
+      <label>Email</label><input name="email" autocomplete="username" required>
+      <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
       <div style="margin-top:12px" class="row">
         <button class="btn" type="submit">Sign in</button>
         <a class="btn" href="/auth/discord">Sign in with Discord</a>
@@ -873,24 +1018,107 @@ EOF
 <body><div class="wrap">
   <div class="card">
     <div class="top">
-      <div><h2 style="margin:0">Dashboard</h2><div class="muted">Signed in as <%= user.email %> (<%= user.role %>)</div></div>
+      <div>
+        <h2 style="margin:0">Dashboard</h2>
+        <div class="muted">Signed in as <%= user.email %> (<%= user.role %>)</div>
+      </div>
       <form method="post" action="/logout"><button class="btn" type="submit">Logout</button></form>
     </div>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0">Orders</h3>
-    <div class="muted">This installer includes ordering endpoints and Stripe webhooks. If you want the full Plans/Eggs/Mapping/Coupons admin suite in this exact build, ask and I will expand the script.</div>
-  </div>
+  <div class="row">
+    <div class="col">
+      <div class="card">
+        <h3 style="margin-top:0">Order a Server</h3>
 
-  <% if (user.role === "owner" || user.role === "platform_admin") { %>
-  <div class="card">
-    <h3 style="margin-top:0">Admin</h3>
-    <div class="row">
-      <a class="btn" href="/admin/settings/integrations">Integrations</a>
+        <form method="post" action="/checkout">
+          <label>Plan</label>
+          <select name="plan_id">
+            <% plans.forEach(p => { %>
+              <option value="<%= p.id %>"><%= p.name %> (<%= p.kind %>)</option>
+            <% }) %>
+          </select>
+
+          <label>Egg Profile</label>
+          <select name="egg_profile_id">
+            <% eggs.forEach(e => { %>
+              <option value="<%= e.id %>"><%= e.name %> (egg: <%= e.ptero_egg_id %>)</option>
+            <% }) %>
+          </select>
+
+          <label>Coupon Code (optional)</label>
+          <input name="coupon_code" placeholder="VORTEX10">
+
+          <div class="muted" style="margin-top:8px">Paid plans require Stripe enabled and a Stripe Price ID on the plan.</div>
+
+          <div style="margin-top:12px" class="row">
+            <button class="btn" type="submit">Checkout (paid plans)</button>
+          </div>
+        </form>
+
+        <hr style="border:0;border-top:1px solid rgba(255,255,255,.10);margin:14px 0">
+
+        <h4 style="margin:0 0 10px">Free Plan Order</h4>
+        <form method="post" action="/order/free">
+          <label>Free Plan</label>
+          <select name="plan_id">
+            <% plans.filter(p=>p.kind==='free').forEach(p => { %>
+              <option value="<%= p.id %>"><%= p.name %> (limit: <%= p.max_services_per_user %>)</option>
+            <% }) %>
+          </select>
+
+          <label>Egg Profile</label>
+          <select name="egg_profile_id">
+            <% eggs.forEach(e => { %>
+              <option value="<%= e.id %>"><%= e.name %></option>
+            <% }) %>
+          </select>
+
+          <div style="margin-top:12px">
+            <button class="btn" type="submit">Create Free Server</button>
+          </div>
+          <div class="muted" style="margin-top:8px">Free plans are limited by the plan's “max services per user”.</div>
+        </form>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="card">
+        <h3 style="margin-top:0">Your Services</h3>
+        <% if (!services.length) { %>
+          <div class="muted">No services yet.</div>
+        <% } else { %>
+          <table>
+            <thead><tr><th>Plan</th><th>Egg</th><th>Status</th><th>Pterodactyl</th></tr></thead>
+            <tbody>
+              <% services.forEach(s => { %>
+                <tr>
+                  <td><%= s.plan_name || "n/a" %></td>
+                  <td><%= s.egg_name || "n/a" %></td>
+                  <td><span class="badge"><%= s.status %></span></td>
+                  <td><%= s.ptero_server_id || "-" %></td>
+                </tr>
+              <% }) %>
+            </tbody>
+          </table>
+        <% } %>
+      </div>
+
+      <% if (user.role === "owner" || user.role === "platform_admin") { %>
+      <div class="card">
+        <h3 style="margin-top:0">Admin</h3>
+        <div class="row">
+          <a class="btn" href="/admin/settings/integrations">Integrations</a>
+          <a class="btn" href="/admin/plans">Plans</a>
+          <a class="btn" href="/admin/eggs">Egg Profiles</a>
+          <a class="btn" href="/admin/mappings">Plan ↔ Egg Mapping</a>
+          <a class="btn" href="/admin/coupons">Coupons</a>
+        </div>
+        <div class="muted" style="margin-top:8px">Set Pterodactyl Node ID for automatic allocation selection.</div>
+      </div>
+      <% } %>
     </div>
   </div>
-  <% } %>
 </div></body></html>
 EOF
 
@@ -902,8 +1130,13 @@ EOF
 <body><div class="wrap">
   <div class="card">
     <div class="top">
-      <div><h2 style="margin:0">Admin → Integrations</h2><div class="muted">Set node_id for auto allocation; allocation_id is optional fallback.</div></div>
-      <a class="btn" href="/dashboard">Back</a>
+      <div>
+        <h2 style="margin:0">Admin → Integrations</h2>
+        <div class="muted">Node ID enables auto allocation. Allocation ID is optional fallback.</div>
+      </div>
+      <div class="row" style="gap:8px">
+        <a class="btn" href="/dashboard">Back</a>
+      </div>
     </div>
   </div>
 
@@ -949,11 +1182,226 @@ EOF
 </div></body></html>
 EOF
 
-  # Worker
+  cat > "${INSTALL_DIR}/app/views/plans.ejs" <<'EOF'
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/_assets/app.css">
+<title>Plans</title></head>
+<body><div class="wrap">
+  <div class="card">
+    <div class="top">
+      <div>
+        <h2 style="margin:0">Admin → Plans</h2>
+        <div class="muted">Supports free + Stripe subscription plans</div>
+      </div>
+      <a class="btn" href="/dashboard">Back</a>
+    </div>
+  </div>
+
+  <form class="card" method="post" action="/admin/plans">
+    <h3 style="margin-top:0">Create Plan</h3>
+    <div class="row">
+      <div class="col"><label>Name</label><input name="name" required></div>
+      <div class="col">
+        <label>Kind</label>
+        <select name="kind">
+          <option value="stripe_subscription">stripe_subscription</option>
+          <option value="free">free</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:12px"><button class="btn" type="submit">Create</button></div>
+  </form>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th><th>Kind</th><th>Active</th>
+          <th>Stripe Price ID</th>
+          <th>Memory</th><th>Disk</th><th>CPU</th>
+          <th>Max Services/User (free)</th>
+          <th>Save</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% plans.forEach(p => { %>
+          <tr>
+            <form method="post" action="/admin/plans/<%= p.id %>">
+              <td><%= p.name %></td>
+              <td>
+                <select name="kind">
+                  <option value="stripe_subscription" <%= p.kind==='stripe_subscription'?'selected':'' %>>stripe_subscription</option>
+                  <option value="free" <%= p.kind==='free'?'selected':'' %>>free</option>
+                </select>
+              </td>
+              <td><input type="checkbox" name="active" <%= p.active ? "checked":"" %>></td>
+              <td><input name="stripe_price_id" value="<%= p.stripe_price_id || '' %>" placeholder="price_..."></td>
+              <td><input name="memory_mb" value="<%= p.memory_mb %>"></td>
+              <td><input name="disk_mb" value="<%= p.disk_mb %>"></td>
+              <td><input name="cpu" value="<%= p.cpu %>"></td>
+              <td><input name="max_services_per_user" value="<%= p.max_services_per_user %>"></td>
+              <td><button class="btn" type="submit">Update</button></td>
+            </form>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </div>
+</div></body></html>
+EOF
+
+  cat > "${INSTALL_DIR}/app/views/eggs.ejs" <<'EOF'
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/_assets/app.css">
+<title>Egg Profiles</title></head>
+<body><div class="wrap">
+  <div class="card">
+    <div class="top">
+      <div>
+        <h2 style="margin:0">Admin → Egg Profiles</h2>
+        <div class="muted">Egg ID + optional startup/docker + environment JSON</div>
+      </div>
+      <a class="btn" href="/dashboard">Back</a>
+    </div>
+  </div>
+
+  <form class="card" method="post" action="/admin/eggs">
+    <h3 style="margin-top:0">Create Egg Profile</h3>
+    <div class="row">
+      <div class="col"><label>Name</label><input name="name" required></div>
+      <div class="col"><label>Pterodactyl Egg ID</label><input name="ptero_egg_id" required></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn" type="submit">Create</button></div>
+  </form>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Active</th><th>Egg</th><th>Docker</th><th>Startup</th><th>Env JSON</th><th>Save</th></tr></thead>
+      <tbody>
+        <% eggs.forEach(e => { %>
+          <tr>
+            <form method="post" action="/admin/eggs/<%= e.id %>">
+              <td><%= e.id %></td>
+              <td>
+                <input name="name" value="<%= e.name %>">
+                <div class="muted">Description</div>
+                <input name="description" value="<%= e.description || '' %>">
+              </td>
+              <td><input type="checkbox" name="active" <%= e.active ? "checked":"" %>></td>
+              <td><input name="ptero_egg_id" value="<%= e.ptero_egg_id %>"></td>
+              <td><input name="docker_image" value="<%= e.docker_image || '' %>" placeholder="optional"></td>
+              <td><input name="startup" value="<%= e.startup || '' %>" placeholder="optional"></td>
+              <td><textarea name="environment_json"><%= JSON.stringify(e.environment_json || {}, null, 2) %></textarea></td>
+              <td><button class="btn" type="submit">Update</button></td>
+            </form>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </div>
+</div></body></html>
+EOF
+
+  cat > "${INSTALL_DIR}/app/views/mappings.ejs" <<'EOF'
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/_assets/app.css">
+<title>Plan ↔ Egg Mapping</title></head>
+<body><div class="wrap">
+  <div class="card">
+    <div class="top">
+      <div>
+        <h2 style="margin:0">Admin → Plan ↔ Egg Mapping</h2>
+        <div class="muted">Select which egg profiles are allowed for each plan</div>
+      </div>
+      <a class="btn" href="/dashboard">Back</a>
+    </div>
+  </div>
+
+  <form class="card" method="post" action="/admin/mappings">
+    <table>
+      <thead>
+        <tr>
+          <th>Plan \ Egg</th>
+          <% eggs.forEach(e => { %><th><%= e.name %><div class="muted">egg <%= e.ptero_egg_id %></div></th><% }) %>
+        </tr>
+      </thead>
+      <tbody>
+        <% plans.forEach(p => { %>
+          <tr>
+            <td><strong><%= p.name %></strong><div class="muted"><%= p.kind %></div></td>
+            <% eggs.forEach(e => {
+                 const key = `${p.id}:${e.id}`;
+                 const checked = set.has(key);
+            %>
+              <td><input type="checkbox" name="map_<%= p.id %>_<%= e.id %>" <%= checked ? "checked":"" %>></td>
+            <% }) %>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    <div style="margin-top:12px"><button class="btn" type="submit">Save Mapping</button></div>
+  </form>
+</div></body></html>
+EOF
+
+  cat > "${INSTALL_DIR}/app/views/coupons.ejs" <<'EOF'
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/_assets/app.css">
+<title>Coupons</title></head>
+<body><div class="wrap">
+  <div class="card">
+    <div class="top">
+      <div>
+        <h2 style="margin:0">Admin → Coupons</h2>
+        <div class="muted">Link Stripe coupon IDs for discounts in checkout</div>
+      </div>
+      <a class="btn" href="/dashboard">Back</a>
+    </div>
+  </div>
+
+  <form class="card" method="post" action="/admin/coupons">
+    <h3 style="margin-top:0">Create Coupon</h3>
+    <div class="row">
+      <div class="col"><label>Code</label><input name="code" required placeholder="VORTEX10"></div>
+      <div class="col"><label>Stripe Coupon ID</label><input name="stripe_coupon_id" placeholder="coupon_..."></div>
+    </div>
+    <div class="row">
+      <div class="col"><label>Max redemptions</label><input name="max_redemptions" placeholder="100"></div>
+      <div class="col"><label>Expires at (YYYY-MM-DD)</label><input name="expires_at" placeholder="2026-01-01"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn" type="submit">Create</button></div>
+  </form>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Code</th><th>Stripe</th><th>Redeemed</th><th>Expires</th><th>Active</th></tr></thead>
+      <tbody>
+        <% coupons.forEach(c => { %>
+          <tr>
+            <td><%= c.code %></td>
+            <td><%= c.stripe_coupon_id || "-" %></td>
+            <td><%= c.redeemed_count %><%= c.max_redemptions ? " / " + c.max_redemptions : "" %></td>
+            <td><%= c.expires_at ? String(c.expires_at).slice(0,10) : "-" %></td>
+            <td><%= c.active ? "yes" : "no" %></td>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </div>
+</div></body></html>
+EOF
+
+  # --------------------
+  # WORKER
+  # --------------------
   cat > "${INSTALL_DIR}/worker/package.json" <<'EOF'
 {
   "name": "vortex-mc-worker",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": { "start": "node worker.js" },
@@ -1106,6 +1554,10 @@ async function provision(serviceId) {
   if (!svcQ.rows.length) throw new Error("Service not found or missing plan/egg profile.");
   const svc = svcQ.rows[0];
 
+  // ensure mapping still exists
+  const allowed = await pool.query("select 1 from plan_egg_profiles where plan_id=$1 and egg_profile_id=$2", [svc.plan_id, svc.egg_profile_id]);
+  if (!allowed.rows.length) throw new Error("Plan↔Egg mapping does not allow this egg.");
+
   const pteroUserId = await ensurePteroUser(svc.user_id);
 
   let allocationId = null;
@@ -1186,7 +1638,7 @@ while (true) {
 }
 EOF
 
-  log "All files written."
+  log "Files written."
 }
 
 start_stack() {
@@ -1203,14 +1655,21 @@ print_next_steps() {
   echo
   echo "Open: https://${domain}/login"
   echo
-  echo "If fresh install, get the one-time owner password:"
+  echo "If this is a fresh install, fetch the one-time owner password:"
   echo "  cd ${INSTALL_DIR} && docker compose logs -n 250 app | sed -n '/INITIAL OWNER CREATED/,+6p'"
   echo
-  echo "Admin → Integrations:"
-  echo "  - Pterodactyl URL + App API key"
-  echo "  - Location ID"
-  echo "  - Node ID (recommended; enables auto allocation)"
-  echo "  - Allocation ID (optional fallback)"
+  echo "Admin setup order:"
+  echo "  1) Admin → Integrations"
+  echo "     - Pterodactyl URL + App API Key"
+  echo "     - Location ID"
+  echo "     - Node ID (recommended; enables auto allocation)"
+  echo "     - Allocation ID (optional fallback)"
+  echo "     - Stripe + Discord optional"
+  echo "  2) Admin → Egg Profiles: set correct egg IDs + env JSON"
+  echo "  3) Admin → Plans: create free/paid plans; set limits; set Stripe Price IDs for paid"
+  echo "  4) Admin → Plan ↔ Egg Mapping: enable eggs per plan"
+  echo "  5) Stripe webhook endpoint:"
+  echo "     https://${domain}/webhooks/stripe"
   echo
   echo "Ops:"
   echo "  cd ${INSTALL_DIR}"
@@ -1221,13 +1680,13 @@ print_next_steps() {
 
 main() {
   require_root
-  require_ubuntu_2204
+  require_ubuntu_2504
 
   local domain="${DOMAIN_DEFAULT}"
   if [[ -n "${DOMAIN:-}" ]]; then domain="${DOMAIN}"; fi
 
   install_packages
-  install_docker
+  install_docker_2504
   configure_firewall
   ensure_env "${domain}"
   write_stack "${domain}"
